@@ -611,6 +611,18 @@ def test_heterogeneous_moe_matches_precision_oracles(
     monkeypatch.setenv("AITER_BF16_FP8_MOE_BOUND", "0")
     monkeypatch.setenv("AITER_FLYDSL_FORCE_REDUCE", "1")
     forced, unfused, context = _run_composed_oracle(profile, weights, m)
+    preallocated = torch.empty_like(forced)
+    forced_out = fused_moe(
+        context["hidden"],
+        weights.routed_w1,
+        weights.routed_w2,
+        context["all_weight"],
+        context["all_ids"],
+        moe_output=preallocated,
+        **context["hetero_kwargs"],
+    )
+    assert forced_out is preallocated
+    assert torch.equal(forced, forced_out)
     stress_repeats = int(os.environ.get("AITER_HETERO_MOE_STRESS_REPEATS", "1"))
     assert stress_repeats > 0
     for repeat in range(stress_repeats):
@@ -766,7 +778,8 @@ def test_no_shared_explicit_defaults_preserve_old_api_output(
 
 
 def test_heterogeneous_moe_uses_a_separate_custom_op_schema():
-    from aiter.fhmoe import fhmoe_
+    from aiter.fhmoe import fhmoe_, fhmoe_out_
+    from aiter.fused_moe import fused_moe_out_
     from aiter.ops.flydsl.fhmoe import (
         flydsl_fhmoe_stage1,
         flydsl_fhmoe_stage2,
@@ -782,8 +795,12 @@ def test_heterogeneous_moe_uses_a_separate_custom_op_schema():
     from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
 
     assert callable(fhmoe_)
+    assert callable(fhmoe_out_)
+    assert callable(fused_moe_out_)
     legacy_schema = torch.ops.aiter.fused_moe_.default._schema
+    legacy_out_schema = torch.ops.aiter.fused_moe_out_.default._schema
     fhmoe_schema = torch.ops.aiter.fhmoe_.default._schema
+    fhmoe_out_schema = torch.ops.aiter.fhmoe_out_.default._schema
     fhmoe_fields = {
         "shared_w1",
         "shared_w2",
@@ -792,10 +809,23 @@ def test_heterogeneous_moe_uses_a_separate_custom_op_schema():
         "shared_expert_id",
     }
     legacy_schema_fields = {argument.name for argument in legacy_schema.arguments}
+    legacy_out_schema_fields = {
+        argument.name for argument in legacy_out_schema.arguments
+    }
     fhmoe_schema_fields = {argument.name for argument in fhmoe_schema.arguments}
+    fhmoe_out_schema_fields = {
+        argument.name for argument in fhmoe_out_schema.arguments
+    }
 
     assert fhmoe_fields.isdisjoint(legacy_schema_fields)
     assert fhmoe_fields <= fhmoe_schema_fields
+    assert "moe_output" not in legacy_schema_fields
+    assert "moe_output" in legacy_out_schema_fields
+    assert "moe_output" not in fhmoe_schema_fields
+    assert "moe_output" in fhmoe_out_schema_fields
+    assert fhmoe_fields <= fhmoe_out_schema_fields
+    assert len(legacy_out_schema.returns) == 0
+    assert len(fhmoe_out_schema.returns) == 0
 
     ordinary_apis = (
         flydsl_moe_stage1,

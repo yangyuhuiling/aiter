@@ -355,7 +355,6 @@ def fhmoe_fake(
     shared_w1_scale: torch.Tensor | None = None,
     shared_w2_scale: torch.Tensor | None = None,
     shared_expert_id: int = -1,
-    moe_output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     del (
         w1,
@@ -383,8 +382,6 @@ def fhmoe_fake(
         shared_w2_scale,
         shared_expert_id,
     )
-    if moe_output is not None:
-        return moe_output
     output_dtype = hidden_states.dtype if dtype is None else dtype
     return torch.empty(
         (topk_ids.shape[0], w2.shape[1]),
@@ -393,7 +390,10 @@ def fhmoe_fake(
     )
 
 
-@torch_compile_guard(gen_fake=fhmoe_fake)
+@torch_compile_guard(
+    mutates_args=[],
+    gen_fake=fhmoe_fake,
+)
 def fhmoe_(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,
@@ -423,8 +423,172 @@ def fhmoe_(
     shared_w1_scale: torch.Tensor | None = None,
     shared_w2_scale: torch.Tensor | None = None,
     shared_expert_id: int = -1,
-    moe_output: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    return _fhmoe_impl(
+        hidden_states=hidden_states,
+        w1=w1,
+        w2=w2,
+        topk_weight=topk_weight,
+        topk_ids=topk_ids,
+        expert_mask=expert_mask,
+        activation=activation,
+        quant_type=quant_type,
+        doweight_stage1=doweight_stage1,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        a1_scale=a1_scale,
+        a2_scale=a2_scale,
+        block_size_M=block_size_M,
+        num_local_tokens=num_local_tokens,
+        moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
+        dtype=dtype,
+        hidden_pad=hidden_pad,
+        intermediate_pad=intermediate_pad,
+        bias1=bias1,
+        bias2=bias2,
+        swiglu_limit=swiglu_limit,
+        gate_mode=gate_mode,
+        shared_w1=shared_w1,
+        shared_w2=shared_w2,
+        shared_w1_scale=shared_w1_scale,
+        shared_w2_scale=shared_w2_scale,
+        shared_expert_id=shared_expert_id,
+    )
+
+
+def fhmoe_out_fake(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weight: torch.Tensor,
+    topk_ids: torch.Tensor,
+    moe_output: torch.Tensor,
+    expert_mask: torch.Tensor | None = None,
+    activation: int = ActivationType.Silu.value,
+    quant_type: int = QuantType.No.value,
+    doweight_stage1: bool = False,
+    w1_scale: torch.Tensor | None = None,
+    w2_scale: torch.Tensor | None = None,
+    a1_scale: torch.Tensor | None = None,
+    a2_scale: torch.Tensor | None = None,
+    block_size_M: int = -1,
+    num_local_tokens: torch.Tensor | None = None,
+    moe_sorting_dispatch_policy: int = 0,
+    dtype: torch.dtype | None = None,
+    hidden_pad: int = 0,
+    intermediate_pad: int = 0,
+    bias1: torch.Tensor | None = None,
+    bias2: torch.Tensor | None = None,
+    swiglu_limit: float | None = None,
+    gate_mode: str = GateMode.SEPARATED.value,
+    shared_w1: torch.Tensor | None = None,
+    shared_w2: torch.Tensor | None = None,
+    shared_w1_scale: torch.Tensor | None = None,
+    shared_w2_scale: torch.Tensor | None = None,
+    shared_expert_id: int = -1,
+) -> None:
+    return None
+
+
+@torch_compile_guard(
+    mutates_args=["moe_output"],
+    gen_fake=fhmoe_out_fake,
+)
+def fhmoe_out_(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weight: torch.Tensor,
+    topk_ids: torch.Tensor,
+    moe_output: torch.Tensor,
+    expert_mask: torch.Tensor | None = None,
+    activation: int = ActivationType.Silu.value,
+    quant_type: int = QuantType.No.value,
+    doweight_stage1: bool = False,
+    w1_scale: torch.Tensor | None = None,
+    w2_scale: torch.Tensor | None = None,
+    a1_scale: torch.Tensor | None = None,
+    a2_scale: torch.Tensor | None = None,
+    block_size_M: int = -1,
+    num_local_tokens: torch.Tensor | None = None,
+    moe_sorting_dispatch_policy: int = 0,
+    dtype: torch.dtype | None = None,
+    hidden_pad: int = 0,
+    intermediate_pad: int = 0,
+    bias1: torch.Tensor | None = None,
+    bias2: torch.Tensor | None = None,
+    swiglu_limit: float | None = None,
+    gate_mode: str = GateMode.SEPARATED.value,
+    shared_w1: torch.Tensor | None = None,
+    shared_w2: torch.Tensor | None = None,
+    shared_w1_scale: torch.Tensor | None = None,
+    shared_w2_scale: torch.Tensor | None = None,
+    shared_expert_id: int = -1,
+) -> None:
+    _fhmoe_impl(
+        hidden_states=hidden_states,
+        w1=w1,
+        w2=w2,
+        topk_weight=topk_weight,
+        topk_ids=topk_ids,
+        expert_mask=expert_mask,
+        activation=activation,
+        quant_type=quant_type,
+        doweight_stage1=doweight_stage1,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        a1_scale=a1_scale,
+        a2_scale=a2_scale,
+        block_size_M=block_size_M,
+        num_local_tokens=num_local_tokens,
+        moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
+        dtype=dtype,
+        hidden_pad=hidden_pad,
+        intermediate_pad=intermediate_pad,
+        bias1=bias1,
+        bias2=bias2,
+        swiglu_limit=swiglu_limit,
+        gate_mode=gate_mode,
+        shared_w1=shared_w1,
+        shared_w2=shared_w2,
+        shared_w1_scale=shared_w1_scale,
+        shared_w2_scale=shared_w2_scale,
+        shared_expert_id=shared_expert_id,
+        moe_output=moe_output,
+    )
+
+
+def _fhmoe_impl(
+    hidden_states,
+    w1,
+    w2,
+    topk_weight,
+    topk_ids,
+    expert_mask=None,
+    activation=ActivationType.Silu.value,
+    quant_type=QuantType.No.value,
+    doweight_stage1=False,
+    w1_scale=None,
+    w2_scale=None,
+    a1_scale=None,
+    a2_scale=None,
+    block_size_M=-1,
+    num_local_tokens=None,
+    moe_sorting_dispatch_policy=0,
+    dtype=None,
+    hidden_pad=0,
+    intermediate_pad=0,
+    bias1=None,
+    bias2=None,
+    swiglu_limit=None,
+    gate_mode=GateMode.SEPARATED.value,
+    shared_w1=None,
+    shared_w2=None,
+    shared_w1_scale=None,
+    shared_w2_scale=None,
+    shared_expert_id=-1,
+    moe_output=None,
+):
     from aiter.fused_moe import _fused_moe_impl
 
     activation_enum = ActivationType(activation)
@@ -492,8 +656,25 @@ def fhmoe_(
 
 def _fhmoe(**kwargs) -> torch.Tensor:
     """Call the heterogeneous custom op using the public wrapper arguments."""
+    moe_output = kwargs.pop("moe_output", None)
     kwargs["activation"] = kwargs["activation"].value
     kwargs["quant_type"] = kwargs["quant_type"].value
     block_size_M = kwargs.get("block_size_M")
     kwargs["block_size_M"] = -1 if not block_size_M else block_size_M
-    return fhmoe_(**kwargs)
+    if moe_output is None:
+        return fhmoe_(**kwargs)
+
+    fhmoe_out_(**kwargs, moe_output=moe_output)
+    from aiter.fused_moe import _view_moe_buf_fake
+
+    output_dtype = (
+        kwargs["hidden_states"].dtype
+        if kwargs.get("dtype") is None
+        else kwargs["dtype"]
+    )
+    return _view_moe_buf_fake(
+        moe_output,
+        kwargs["topk_ids"].shape[0],
+        kwargs["w2"].shape[1],
+        output_dtype,
+    )

@@ -81,21 +81,146 @@ kernel_bench_callable = None
 # topk_weights through the sorted_* kernarg slots and accumulate via
 # global_atomic_pk_add_bf16, so moe_sorting is a pass-through for them.
 
+def _alloc_moe_buf(
+    device,
+    M,
+    model_dim,
+    moebuf_dtype,
+    empty=False,
+    moe_buf=None,
+    tail_bytes=0,
+):
+    rows = int(M)
+    cols = int(model_dim)
+    tail_bytes = int(tail_bytes)
+    if rows < 0 or cols < 0:
+        raise ValueError(
+            f"moe_buf shape must be non-negative, got ({rows}, {cols})"
+        )
+    if tail_bytes < 0:
+        raise ValueError(f"tail_bytes must be non-negative, got {tail_bytes}")
 
-def _moe_prepare_unsorted_input(topk_ids, topk_weights, model_dim, moebuf_dtype):
+    if moe_buf is not None:
+        if not isinstance(moe_buf, torch.Tensor):
+            raise TypeError(f"moe_buf must be a torch.Tensor, got {type(moe_buf)!r}")
+
+        expected_device = torch.device(device)
+        if expected_device.type == "cuda" and expected_device.index is None:
+            expected_device = torch.device("cuda", torch.cuda.current_device())
+        if moe_buf.device != expected_device:
+            raise ValueError(
+                f"moe_buf must be on {expected_device}, got {moe_buf.device}"
+            )
+        if not moe_buf.is_contiguous():
+            raise ValueError(
+                f"moe_buf must be contiguous, got stride={tuple(moe_buf.stride())}"
+            )
+
+        required_numel = rows * cols
+        target_elem_size = torch.empty(
+            (), device="meta", dtype=moebuf_dtype
+        ).element_size()
+        required_nbytes = required_numel * target_elem_size
+        view_nbytes = moe_buf.numel() * moe_buf.element_size()
+        if view_nbytes < required_nbytes:
+            raise ValueError(
+                f"moe_buf view has {view_nbytes} bytes, but ({rows}, {cols}) "
+                f"{moebuf_dtype} requires {required_nbytes} bytes"
+            )
+
+        byte_offset = moe_buf.storage_offset() * moe_buf.element_size()
+        if byte_offset % target_elem_size != 0:
+            raise ValueError(
+                f"moe_buf byte offset {byte_offset} is not aligned to "
+                f"{moebuf_dtype} element size {target_elem_size}"
+            )
+        storage_nbytes = moe_buf.untyped_storage().nbytes()
+        available_storage_nbytes = storage_nbytes - byte_offset
+        total_required_nbytes = required_nbytes + tail_bytes
+        if available_storage_nbytes < total_required_nbytes:
+            raise ValueError(
+                f"moe_buf storage has {available_storage_nbytes} bytes available "
+                f"from data_ptr, but output plus tail requires "
+                f"{total_required_nbytes} bytes "
+                f"({required_nbytes} output + {tail_bytes} tail)"
+            )
+
+        if (
+            moe_buf.dtype == moebuf_dtype
+            and tuple(moe_buf.shape) == (rows, cols)
+        ):
+            return moe_buf
+
+        try:
+            raw = moe_buf.view(torch.uint8).view(-1)
+            return raw[:required_nbytes].view(moebuf_dtype).view(rows, cols)
+        except RuntimeError as exc:
+            raise ValueError(
+                f"moe_buf cannot be viewed as ({rows}, {cols}) {moebuf_dtype}"
+            ) from exc
+    if empty:
+        if tail_bytes:
+            raw = torch.empty(tail_bytes, dtype=torch.uint8, device=device)
+            return raw[:0].view(moebuf_dtype).view(0, 0)
+        return torch.empty((0, 0), dtype=moebuf_dtype, device=device)
+    if tail_bytes:
+        target_elem_size = torch.empty(
+            (), device="meta", dtype=moebuf_dtype
+        ).element_size()
+        required_nbytes = rows * cols * target_elem_size
+        raw = torch.empty(
+            required_nbytes + tail_bytes,
+            dtype=torch.uint8,
+            device=device,
+        )
+        return raw[:required_nbytes].view(moebuf_dtype).view(rows, cols)
+    return torch.empty((rows, cols), dtype=moebuf_dtype, device=device)
+
+
+def _check_moe_buf_no_alias(moe_buf, named_tensors):
+    storage_ptr = moe_buf.untyped_storage().data_ptr()
+    if storage_ptr == 0:
+        return
+    for name, tensor in named_tensors:
+        if (
+            isinstance(tensor, torch.Tensor)
+            and tensor.device == moe_buf.device
+            and tensor.untyped_storage().data_ptr() == storage_ptr
+        ):
+            raise ValueError(f"moe_output must not share storage with {name}")
+
+
+def _view_moe_buf_fake(moe_buf, M, model_dim, dtype):
+    if moe_buf.dtype == dtype and tuple(moe_buf.shape) == (M, model_dim):
+        return moe_buf
+    elem_size = torch.empty((), device="meta", dtype=dtype).element_size()
+    raw = moe_buf.view(torch.uint8).view(-1)
+    return raw[: M * model_dim * elem_size].view(dtype).view(M, model_dim)
+
+
+def _moe_prepare_unsorted_input(topk_ids, topk_weights, model_dim, moebuf_dtype, moe_buf=None):
     device = topk_ids.device
     M = topk_ids.shape[0]
-    # FLAT kernels zero their own output rows on-device and need an
-    # extra M*8-byte per-token coordination region appended to moe_buf.
-    # We over-allocate as a flat byte buffer and expose only the row part.
+    # FLAT kernels zero their own output rows on-device and use one trailing
+    # 64-bit coordination flag at ptr_O + M * model_dim * sizeof(output_dtype).
     #
     # The trailing region does not need initialisation; the kernel
     # tolerates arbitrary contents on the first reference per dispatch.
-    elem_size = torch.empty(0, dtype=moebuf_dtype).element_size()
-    row_bytes = M * model_dim * elem_size
     flag_bytes = 8
-    flat_buf = torch.empty(row_bytes + flag_bytes, dtype=torch.uint8, device=device)
-    moe_buf = flat_buf[:row_bytes].view(moebuf_dtype).view(M, model_dim)
+    moe_buf = _alloc_moe_buf(
+        device,
+        M,
+        model_dim,
+        moebuf_dtype,
+        moe_buf=moe_buf,
+        tail_bytes=flag_bytes,
+    )
+    row_bytes = M * model_dim * moe_buf.element_size()
+    flag_address = moe_buf.data_ptr() + row_bytes
+    if flag_address % flag_bytes != 0:
+        raise ValueError(
+            f"FLAT moe_buf flag address {flag_address:#x} must be 8-byte aligned"
+        )
     topk_ids_i32 = (
         topk_ids
         if topk_ids.dtype == dtypes.i32 and topk_ids.is_contiguous()
@@ -122,6 +247,7 @@ def _adaptive_moe_sort(
     atomic=False,
     emit_aux=False,
     moebuf_dtype=dtypes.bf16,
+    moe_buf=None,
 ):
     device = topk_ids.device
     M = topk_ids.shape[0]
@@ -135,11 +261,7 @@ def _adaptive_moe_sort(
     sorted_weights = torch.empty(max_sorted, dtype=dtypes.fp32, device=device)
     reverse_sorted = torch.empty(M * topk, dtype=dtypes.i32, device=device)
     m_indices = torch.empty(max_sorted, dtype=dtypes.i32, device=device)
-    moe_buf = (
-        torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
-        if atomic
-        else torch.empty((0, 0), dtype=moebuf_dtype, device=device)
-    )
+    moe_buf = _alloc_moe_buf(device, M, model_dim, moebuf_dtype, empty=(not atomic), moe_buf=moe_buf)
     empty_bf16 = _empty_bf16(device)
     bf16_zero = moe_buf if (atomic and BM == 16) else empty_bf16
 
@@ -182,6 +304,7 @@ def _moe_sorting_impl(
     return_local_topk_ids=False,
     accumulate=True,
     output_aux=False,
+    moe_buf=None,
 ):
     device = topk_ids.device
     M, topk = topk_ids.shape
@@ -199,6 +322,7 @@ def _moe_sorting_impl(
             atomic=accumulate,
             emit_aux=True,
             moebuf_dtype=moebuf_dtype,
+            moe_buf=moe_buf,
         )
 
     # -- Opus / CK standard path --
@@ -214,10 +338,7 @@ def _moe_sorting_impl(
     #  - accumulate (or EP w/ expert_mask): stage2 atomically accumulates into [M, model_dim].
     #  - else (FlyDSL stage2 reduce mode without mask): caller owns the
     #    [M, topk, model_dim] intermediate; allocate a placeholder here.
-    if (expert_mask is not None) or accumulate:
-        moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
-    else:
-        moe_buf = torch.empty((0, 0), dtype=moebuf_dtype, device=device)
+    moe_buf = _alloc_moe_buf(device, M, model_dim, moebuf_dtype, empty=(expert_mask is None and (not accumulate)), moe_buf=moe_buf)
     local_topk_ids = torch.empty_like(topk_ids) if return_local_topk_ids else None
     if return_local_topk_ids:
         # CK sorting does not emit local ids; use Opus so callers do not need a slow
@@ -294,6 +415,7 @@ def _flydsl_moe_sorting(
     expert_mask,
     num_local_tokens,
     accumulate=True,
+    moe_buf=None,
 ):
     """FlyDSL sorting dispatch — called outside torch_compile_guard."""
     from aiter.ops.flydsl.moe_sorting import flydsl_moe_sorting_fwd
@@ -313,10 +435,7 @@ def _flydsl_moe_sorting(
     # stage2 reduce mode. The kernel no-ops its zero pass on an empty buffer
     # (moe_buf_elems == 0), so reduce mode skips zeroing the [M, model_dim]
     # buffer entirely — the caller owns the [M, topk, model_dim] intermediate.
-    if (expert_mask is not None) or accumulate:
-        moe_buf = torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
-    else:
-        moe_buf = torch.empty((0, 0), dtype=moebuf_dtype, device=device)
+    moe_buf = _alloc_moe_buf(device, M, model_dim, moebuf_dtype, empty=(expert_mask is None and (not accumulate)), moe_buf=moe_buf)
 
     flydsl_moe_sorting_fwd(
         topk_ids,
@@ -348,6 +467,7 @@ def moe_sorting(
     accumulate=True,
     flat=False,
     output_aux=False,
+    moe_buf=None,
 ):
     if (
         not _USE_CK_MOE_SORTING
@@ -368,11 +488,12 @@ def moe_sorting(
             expert_mask,
             num_local_tokens,
             accumulate=accumulate,
+            moe_buf=moe_buf,
         )
     # FLAT kernel: in-kernel routing (manifest flat=1); pass through unsorted topk.
     if flat:
         return _moe_prepare_unsorted_input(
-            topk_ids, topk_weights, model_dim, moebuf_dtype
+            topk_ids, topk_weights, model_dim, moebuf_dtype, moe_buf=moe_buf,
         )
     try:
         return _moe_sorting_impl(
@@ -389,6 +510,7 @@ def moe_sorting(
             return_local_topk_ids=return_local_topk_ids,
             accumulate=accumulate,
             output_aux=output_aux,
+            moe_buf=moe_buf,
         )
     except Exception as e:
         logger.error(f"Error in moe_sorting: {e}")
@@ -530,33 +652,43 @@ def fused_moe(
         )
     if not block_size_M:
         block_size_M = -1
-    return fused_moe_(
-        hidden_states=hidden_states,
-        w1=w1,
-        w2=w2,
-        topk_weight=topk_weight,
-        topk_ids=topk_ids,
-        expert_mask=expert_mask,
-        activation=activation.value,
-        quant_type=quant_type.value,
-        doweight_stage1=doweight_stage1,
-        w1_scale=w1_scale,
-        w2_scale=w2_scale,
-        a1_scale=a1_scale,
-        a2_scale=a2_scale,
-        block_size_M=block_size_M,
-        num_local_tokens=num_local_tokens,
-        moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
-        dtype=dtype,
-        hidden_pad=hidden_pad,
-        intermediate_pad=intermediate_pad,
-        bias1=bias1,
-        bias2=bias2,
-        swiglu_limit=swiglu_limit,
-        beta=beta,
-        linear_beta=linear_beta,
-        gate_mode=gate_mode,
-        moe_output=moe_output,
+    op_kwargs = {
+        "hidden_states": hidden_states,
+        "w1": w1,
+        "w2": w2,
+        "topk_weight": topk_weight,
+        "topk_ids": topk_ids,
+        "expert_mask": expert_mask,
+        "activation": activation.value,
+        "quant_type": quant_type.value,
+        "doweight_stage1": doweight_stage1,
+        "w1_scale": w1_scale,
+        "w2_scale": w2_scale,
+        "a1_scale": a1_scale,
+        "a2_scale": a2_scale,
+        "block_size_M": block_size_M,
+        "num_local_tokens": num_local_tokens,
+        "moe_sorting_dispatch_policy": moe_sorting_dispatch_policy,
+        "dtype": dtype,
+        "hidden_pad": hidden_pad,
+        "intermediate_pad": intermediate_pad,
+        "bias1": bias1,
+        "bias2": bias2,
+        "swiglu_limit": swiglu_limit,
+        "beta": beta,
+        "linear_beta": linear_beta,
+        "gate_mode": gate_mode,
+    }
+    if moe_output is None:
+        return fused_moe_(**op_kwargs)
+
+    fused_moe_out_(**op_kwargs, moe_output=moe_output)
+    output_dtype = hidden_states.dtype if dtype is None else dtype
+    return _view_moe_buf_fake(
+        moe_output,
+        topk_ids.shape[0],
+        w2.shape[1],
+        output_dtype,
     )
 
 
@@ -585,11 +717,10 @@ def fused_moe_fake(
     bias1: torch.Tensor | None = None,
     bias2: torch.Tensor | None = None,
     swiglu_limit: float | None = None,
+    beta: float | None = None,
+    linear_beta: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
-    moe_output: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    if moe_output is not None:
-        return moe_output
     device = topk_ids.device
     M, _topk = topk_ids.shape
     dtype = hidden_states.dtype if dtype is None else dtype
@@ -598,7 +729,10 @@ def fused_moe_fake(
     return moe_buf
 
 
-@torch_compile_guard(gen_fake=fused_moe_fake)
+@torch_compile_guard(
+    mutates_args=[],
+    gen_fake=fused_moe_fake,
+)
 def fused_moe_(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
@@ -627,9 +761,100 @@ def fused_moe_(
     beta: float | None = None,
     linear_beta: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
-    moe_output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     return _fused_moe_impl(
+        hidden_states=hidden_states,
+        w1=w1,
+        w2=w2,
+        topk_weight=topk_weight,
+        topk_ids=topk_ids,
+        expert_mask=expert_mask,
+        activation=activation,
+        quant_type=quant_type,
+        doweight_stage1=doweight_stage1,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        a1_scale=a1_scale,
+        a2_scale=a2_scale,
+        block_size_M=block_size_M,
+        num_local_tokens=num_local_tokens,
+        moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
+        dtype=dtype,
+        hidden_pad=hidden_pad,
+        intermediate_pad=intermediate_pad,
+        bias1=bias1,
+        bias2=bias2,
+        swiglu_limit=swiglu_limit,
+        beta=beta,
+        linear_beta=linear_beta,
+        gate_mode=gate_mode,
+    )
+
+
+def fused_moe_out_fake(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weight: torch.Tensor,
+    topk_ids: torch.Tensor,
+    moe_output: torch.Tensor,
+    expert_mask: torch.Tensor | None = None,
+    activation: int = ActivationType.Silu.value,
+    quant_type: int = QuantType.No.value,
+    doweight_stage1: bool = False,
+    w1_scale: torch.Tensor | None = None,
+    w2_scale: torch.Tensor | None = None,
+    a1_scale: torch.Tensor | None = None,
+    a2_scale: torch.Tensor | None = None,
+    block_size_M: int = -1,
+    num_local_tokens: torch.Tensor | None = None,
+    moe_sorting_dispatch_policy: int = 0,
+    dtype: torch.dtype | None = None,
+    hidden_pad: int = 0,
+    intermediate_pad: int = 0,
+    bias1: torch.Tensor | None = None,
+    bias2: torch.Tensor | None = None,
+    swiglu_limit: float | None = None,
+    beta: float | None = None,
+    linear_beta: float | None = None,
+    gate_mode: str = GateMode.SEPARATED.value,
+) -> None:
+    return None
+
+
+@torch_compile_guard(
+    mutates_args=["moe_output"],
+    gen_fake=fused_moe_out_fake,
+)
+def fused_moe_out_(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weight: torch.Tensor,
+    topk_ids: torch.Tensor,
+    moe_output: torch.Tensor,
+    expert_mask: torch.Tensor | None = None,
+    activation: int = ActivationType.Silu.value,
+    quant_type: int = QuantType.No.value,
+    doweight_stage1: bool = False,
+    w1_scale: torch.Tensor | None = None,
+    w2_scale: torch.Tensor | None = None,
+    a1_scale: torch.Tensor | None = None,
+    a2_scale: torch.Tensor | None = None,
+    block_size_M: int = -1,
+    num_local_tokens: torch.Tensor | None = None,
+    moe_sorting_dispatch_policy: int = 0,
+    dtype: torch.dtype | None = None,
+    hidden_pad: int = 0,
+    intermediate_pad: int = 0,
+    bias1: torch.Tensor | None = None,
+    bias2: torch.Tensor | None = None,
+    swiglu_limit: float | None = None,
+    beta: float | None = None,
+    linear_beta: float | None = None,
+    gate_mode: str = GateMode.SEPARATED.value,
+) -> None:
+    _fused_moe_impl(
         hidden_states=hidden_states,
         w1=w1,
         w2=w2,
@@ -718,9 +943,46 @@ def _fused_moe_impl(
         dtypes.bf16,
     ], f"Fused_moe unsupported out dtype: {dtype}"
     if _moe_output is not None:
-        assert _moe_output.shape == (M, model_dim) and _moe_output.dtype == dtype, (
-            f"moe_output must be ({M}, {model_dim}) {dtype}, "
-            f"got {tuple(_moe_output.shape)} {_moe_output.dtype}"
+        _moe_output = _alloc_moe_buf(
+            hidden_states.device,
+            M,
+            model_dim,
+            dtype,
+            moe_buf=_moe_output,
+        )
+        extra_tensors = []
+        for prefix, values in (
+            ("stage1_extra", _stage1_extra_args),
+            ("stage2_extra", _stage2_extra_args),
+        ):
+            if values:
+                extra_tensors.extend(
+                    (f"{prefix}.{name}", tensor)
+                    for name, tensor in values.items()
+                )
+        _check_moe_buf_no_alias(
+            _moe_output,
+            (
+                ("hidden_states", hidden_states),
+                ("w1", w1),
+                ("w2", w2),
+                ("topk_weight", topk_weight),
+                ("topk_ids", topk_ids),
+                ("expert_mask", expert_mask),
+                ("w1_scale", w1_scale),
+                ("w2_scale", w2_scale),
+                ("a1_scale", a1_scale),
+                ("a2_scale", a2_scale),
+                ("bias1", bias1),
+                ("bias2", bias2),
+                *extra_tensors,
+            ),
+        )
+    if M == 0:
+        return (
+            _moe_output
+            if _moe_output is not None
+            else torch.empty((0, model_dim), dtype=dtype, device=hidden_states.device)
         )
     quant_type = quant_remap.get(quant_type, quant_type)
     q_dtype_w = w1.dtype
@@ -906,7 +1168,7 @@ def _fused_moe_impl(
             )
         _kn2 = metadata.stage2.keywords.get("kernelName2", "")
         _atomic = parse_g2_kname_any(_kn2)["atomic"]
-        _use_accumulate = _atomic
+        sort_moe_buf = _moe_output if _atomic else None
         (
             sorted_ids,
             sorted_weights,
@@ -924,10 +1186,14 @@ def _fused_moe_impl(
             block_size_M,
             accumulate=_atomic,
             output_aux=True,
+            moe_buf=sort_moe_buf,
         )
+        if _moe_output is not None and not _atomic:
+            moe_buf = _moe_output
         local_topk_ids = None
     else:
-        _use_accumulate = not stage2_uses_route_reduce(metadata.stage2)
+        _accumulate = not stage2_uses_route_reduce(metadata.stage2)
+        sort_moe_buf = _moe_output if _accumulate else None
         sorting_ret = moe_sorting(
             topk_ids,
             topk_weight,
@@ -939,8 +1205,9 @@ def _fused_moe_impl(
             num_local_tokens,
             moe_sorting_dispatch_policy,
             return_local_topk_ids=need_local_topk_ids,
-            accumulate=_use_accumulate,
+            accumulate=_accumulate,
             flat=metadata.flat,
+            moe_buf=sort_moe_buf,
         )
         if need_local_topk_ids:
             (
@@ -956,13 +1223,9 @@ def _fused_moe_impl(
                 sorting_ret
             )
             local_topk_ids = None
+        if _moe_output is not None and not _accumulate:
+            moe_buf = _moe_output
     _opus_a8w4.check_route_bucket_metadata(metadata, sorted_expert_ids, logger)
-
-    _use_external_output = _moe_output is not None and not metadata.flat
-    if _use_external_output:
-        if _use_accumulate:
-            _moe_output.zero_()
-        moe_buf = _moe_output
 
     if metadata.run_1stage:
         _stage1_call = functools.partial(
@@ -991,9 +1254,9 @@ def _fused_moe_impl(
         )
         if kernel_bench_callable is not None:
             kernel_bench_callable.append(("stage1", _stage1_call))
-        result = _stage1_call()
+        return _stage1_call()
     else:
-        result = fused_moe_2stages(
+        return fused_moe_2stages(
             hidden_states,
             w1,
             w2,
@@ -1034,10 +1297,6 @@ def _fused_moe_impl(
             _stage1_extra_args=_stage1_extra_args,
             _stage2_extra_args=_stage2_extra_args,
         )
-
-    if _moe_output is not None and result.data_ptr() != _moe_output.data_ptr():
-        _moe_output.copy_(result)
-    return result
 
 
 def fused_moe_1stage(
