@@ -41,6 +41,7 @@ skip_tests=(
     "op_tests/multigpu_tests/test_mori_all2all.py"
     "op_tests/multigpu_tests/test_fused_ar_rms.py"
     "op_tests/multigpu_tests/test_mega_moe_v2.py"
+    "op_tests/multigpu_tests/tp_moe_stage1_ref.py"
     "op_tests/multigpu_tests/triton_test/test_reduce_scatter_all_gather.py"
     "op_tests/multigpu_tests/triton_test/test_fused_rs_rmsnorm_quant_ag.py"
 )
@@ -84,6 +85,35 @@ for file in "${sharded_files[@]}"; do
     # batch gate so they exercise the persistent kernel at every batch size.
     test_cmd=(timeout 60m python3 "$file")
     case "$file" in
+        op_tests/multigpu_tests/test_tp_moe_stage1.py)
+            {
+                echo "Running gfx950 TP4/TP8 TPMoEStage1 correctness suite"
+            } | tee -a latest_test.log
+            test_cmd=(
+                timeout 60m
+                bash -c '
+                    set -euo pipefail
+                    test_file=$1
+                    arch=$(python3 -c \
+                        "from aiter.jit.utils.chip_info import get_gfx_runtime; print(get_gfx_runtime())")
+                    if [[ "$arch" != "gfx950" ]]; then
+                        echo "Skipping $test_file: requires gfx950, got $arch"
+                        exit 0
+                    fi
+                    python3 "$test_file" --case construct capacity exports
+                    for case_name in all_gather forward_contract numerics prequant e2e; do
+                        torchrun --standalone --nproc_per_node=8 \
+                            "$test_file" --case "$case_name"
+                    done
+                    for case_name in prequant e2e; do
+                        env HIP_VISIBLE_DEVICES=0,1,2,3 \
+                            torchrun --standalone --nproc_per_node=4 \
+                            "$test_file" --case "$case_name"
+                    done
+                '
+                _ "$file"
+            )
+            ;;
         op_tests/multigpu_tests/test_mega_moe_gfx1250.py)
             {
                 echo "Running gfx1250 MegaMoE fused-scatter accuracy on 8 GPUs when supported"
