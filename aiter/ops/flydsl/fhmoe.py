@@ -103,10 +103,13 @@ def compile_flydsl_fhmoe_stage2(
     enable_bias: bool = False,
     xcd_swizzle: int = 0,
     shared_expert_id: int = -1,
+    enable_sbo: bool = False,
 ):
     """Compile the heterogeneous stage2 kernel."""
     from .kernels.fhmoe import compile_mixed_fhmoe_gemm2
 
+    if enable_sbo:
+        raise ValueError("MORI SBO v1 is incompatible with FHMoE")
     if b_dtype != "fp4":
         raise ValueError(f"FHMoE stage2 requires routed MXFP4 weights, got {b_dtype}")
     return compile_mixed_fhmoe_gemm2(
@@ -133,6 +136,7 @@ def compile_flydsl_fhmoe_stage2(
         enable_bias=enable_bias,
         xcd_swizzle=xcd_swizzle,
         shared_expert_id=shared_expert_id,
+        enable_sbo=False,
     )
 
 
@@ -216,6 +220,7 @@ def _s2_args_fhmoe(
     blocks,
     dev,
     bias=None,
+    sbo_tile_state=None,
     stream=None,
     *,
     shared_w,
@@ -227,6 +232,9 @@ def _s2_args_fhmoe(
         if bias is not None
         else torch.empty(0, device=dev, dtype=torch.float32)
     )
+    if sbo_tile_state is not None:
+        raise ValueError("MORI SBO v1 is incompatible with FHMoE")
+    empty_sbo_tile_state = torch.empty(0, device=dev, dtype=torch.int32)
     if stream is None:
         stream = torch.cuda.current_stream()
     return (
@@ -242,6 +250,7 @@ def _s2_args_fhmoe(
         ptr_arg(sorted_weights),
         ptr_arg(num_valid_ids),
         ptr_arg(kernel_bias),
+        ptr_arg(empty_sbo_tile_state),
         token_num,
         n_in,
         k_in,

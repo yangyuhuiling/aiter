@@ -108,8 +108,11 @@ def compile_mixed_fhmoe_gemm2(
     b_nt: int = 0,
     xcd_swizzle: int = 0,
     shared_expert_id: int,
+    enable_sbo: bool = False,
 ):
     """Compile a stage2 kernel with an FP8 shared expert."""
+    if enable_sbo:
+        raise ValueError("MORI SBO v1 is incompatible with FHMoE")
     if shared_expert_id is None:
         raise ValueError(
             "FHMoE stage2 requires shared_expert_id == experts - 1; "
@@ -140,4 +143,5 @@ def compile_mixed_fhmoe_gemm2(
         b_nt=b_nt,
         xcd_swizzle=xcd_swizzle,
         shared_expert_id=shared_expert_id,
+        enable_sbo=False,
     )

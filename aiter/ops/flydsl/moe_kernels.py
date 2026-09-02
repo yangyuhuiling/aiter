@@ -720,12 +720,15 @@ def compile_flydsl_moe_stage2(
     inter_dim_pad: int = 0,
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
+    enable_sbo: bool = False,
 ):
     """Compile stage2 kernel (cached via underlying lru_cache)."""
     # a16w-mix (bf16 A x {fp4 mxfp4, int4} W) down-proj: build the ported gemm2
     # (moe_2stage_a16wmix); its gate_up=False W2+scale layout matches the standard
     # shuffle_weight/e8m0 (a16wi4: pack_int8_to_packed_int4(shuffle_weight) + bf16 scale).
     if a_dtype == "bf16" and b_dtype in ("fp4", "int4"):
+        if enable_sbo:
+            raise ValueError("MORI SBO signaling is only implemented for A8W4 stage2")
         from flydsl.runtime.device import get_rocm_arch
 
         from .kernels.moe_2stage_a16wmix.gemm2 import compile_gemm2_a16w4_port
@@ -775,6 +778,7 @@ def compile_flydsl_moe_stage2(
             model_dim_pad=model_dim_pad,
             inter_dim_pad=inter_dim_pad,
             enable_bias=enable_bias,
+            enable_sbo=enable_sbo,
         )
     else:
         raise ValueError(
@@ -920,12 +924,18 @@ def _s2_args_fp4(
     blocks,
     dev,
     bias=None,
+    sbo_tile_state=None,
     stream=None,
 ):
     _bias = (
         bias.view(-1)
         if bias is not None
         else torch.empty(0, device=dev, dtype=torch.float32)
+    )
+    _sbo_tile_state = (
+        sbo_tile_state
+        if sbo_tile_state is not None
+        else torch.empty(0, device=dev, dtype=torch.int32)
     )
     if stream is None:
         stream = torch.cuda.current_stream()
@@ -940,6 +950,7 @@ def _s2_args_fp4(
         ptr_arg(sorted_weights),
         ptr_arg(num_valid_ids),
         ptr_arg(_bias),
+        ptr_arg(_sbo_tile_state),
         token_num,
         n_in,
         k_in,
@@ -2010,12 +2021,16 @@ def _flydsl_moe_stage2_impl(
     return_per_slot: bool = False,
     expert_mask: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
+    sbo_tile_state: torch.Tensor | None = None,
     _compile_kernel=compile_flydsl_moe_stage2,
     _build_mx_args=_s2_args_fp4,
 ) -> torch.Tensor:
     """Run stage2 with injectable compiler and launch-argument builders."""
 
+    enable_sbo = sbo_tile_state is not None
     if a_dtype == "bf16" and b_dtype in ("fp4", "int4"):
+        if enable_sbo:
+            raise ValueError("MORI SBO v1 is incompatible with A16W4 stage2")
         # a16w-mix down-proj (a16w4 mxfp4 / a16wi4 int4): ported gemm2 atomic-scatters
         # into the caller's moe_sorting-zeroed `out`. Tiles from the kernelName (like
         # a4w4/a8w4). a16wi4 W2 uses the OLD-kernel int4 layout
@@ -2078,6 +2093,24 @@ def _flydsl_moe_stage2_impl(
     E = w2.shape[0]
     model_dim = w2.shape[1]
     inter_dim = inter_states.shape[2]
+    if enable_sbo:
+        expected = (7168, 3072, 128, 256, "fp8", "fp4", "atomic")
+        actual = (
+            model_dim,
+            inter_dim,
+            tile_n,
+            tile_k,
+            a_dtype,
+            b_dtype,
+            mode,
+        )
+        if actual != expected or tile_m not in (32, 64):
+            raise ValueError(
+                "MORI SBO v1 requires DSV4 A8W4 atomic stage2 "
+                f"tile_m in (32, 64) and {expected}, got tile_m={tile_m}, {actual}"
+            )
+        if sbo_tile_state.dtype != torch.int32 or not sbo_tile_state.is_contiguous():
+            raise ValueError("sbo_tile_state must be a contiguous int32 tensor")
 
     # Debug: force stage2 to use the masked reduce epilogue instead of atomic
     # accumulate. Enabled by default; set AITER_FLYDSL_FORCE_REDUCE=0 to opt out.
@@ -2208,6 +2241,7 @@ def _flydsl_moe_stage2_impl(
             m_blocks,
             dev,
             bias=bias,
+            sbo_tile_state=sbo_tile_state,
         )
     else:
         args = _s2_args_std(
@@ -2249,6 +2283,7 @@ def _flydsl_moe_stage2_impl(
         inter_dim_pad=inter_dim_pad,
         xcd_swizzle=xcd_swizzle,
         enable_bias=(bias is not None),
+        enable_sbo=enable_sbo,
     )
     _run_compiled(exe, args)
 
@@ -2306,6 +2341,7 @@ def flydsl_moe_stage2(
     return_per_slot: bool = False,
     expert_mask: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
+    sbo_tile_state: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
@@ -2359,6 +2395,7 @@ def flydsl_moe_stage2(
         return_per_slot=return_per_slot,
         expert_mask=expert_mask,
         topk_ids=topk_ids,
+        sbo_tile_state=sbo_tile_state,
     )
 
 

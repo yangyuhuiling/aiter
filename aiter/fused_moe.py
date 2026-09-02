@@ -574,6 +574,7 @@ def fused_moe(
     # copy. Must be contiguous, match shape/dtype/device and not overlap
     # hidden_states, or the call raises; when given it is what gets returned.
     output: torch.Tensor | None = None,
+    sbo_args: dict | None = None,
 ):
     if (
         any(
@@ -582,6 +583,8 @@ def fused_moe(
         )
         or shared_expert_id != -1
     ):
+        if sbo_args is not None:
+            raise ValueError("MORI SBO v1 is incompatible with FHMoE shared weights")
         from aiter.fhmoe import _fhmoe
 
         return _fhmoe(
@@ -619,6 +622,38 @@ def fused_moe(
         block_size_M = -1
     enable_ep_scatter = stage2_scatter is not None
     scatter_source_map = stage2_scatter.source_token_map if enable_ep_scatter else None
+    if sbo_args is not None:
+        if enable_ep_scatter:
+            raise ValueError("MORI SBO is incompatible with stage2_scatter")
+        return _fused_moe_impl(
+            hidden_states=hidden_states,
+            w1=w1,
+            w2=w2,
+            topk_weight=topk_weight,
+            topk_ids=topk_ids,
+            expert_mask=expert_mask,
+            activation=activation.value,
+            quant_type=quant_type.value,
+            doweight_stage1=doweight_stage1,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            a1_scale=a1_scale,
+            a2_scale=a2_scale,
+            block_size_M=block_size_M,
+            num_local_tokens=num_local_tokens,
+            moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
+            dtype=dtype,
+            hidden_pad=hidden_pad,
+            intermediate_pad=intermediate_pad,
+            bias1=bias1,
+            bias2=bias2,
+            swiglu_limit=swiglu_limit,
+            beta=beta,
+            linear_beta=linear_beta,
+            gate_mode=gate_mode,
+            output=output,
+            _sbo_args=sbo_args,
+        )
     return fused_moe_(
         hidden_states=hidden_states,
         w1=w1,
@@ -829,6 +864,7 @@ def _fused_moe_impl(
     _metadata_config_file: str | None = None,
     _stage1_extra_args: dict | None = None,
     _stage2_extra_args: dict | None = None,
+    _sbo_args: dict | None = None,
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
@@ -921,6 +957,16 @@ def _fused_moe_impl(
 
     if _q_dtype_a is not None:
         q_dtype_a = _q_dtype_a
+    if _sbo_args is not None:
+        if (
+            get_gfx() != "gfx950"
+            or quant_type != QuantType.per_1x32
+            or q_dtype_w != dtypes.fp4x2
+        ):
+            raise ValueError("MORI SBO v1 requires gfx950 MXFP4 expert weights")
+        # The low-M heuristic normally selects BF16 activations. SBO's Stage2
+        # producer is the A8W4 kernel, so force its FP8 path for every decode M.
+        q_dtype_a = dtypes.fp8
 
     grouped_a8w4_out = None
     if is_flydsl_available():
@@ -1025,6 +1071,15 @@ def _fused_moe_impl(
 
     if _metadata_transform is not None:
         metadata = _metadata_transform(metadata)
+    if _sbo_args is not None:
+        metadata = _get_mori_sbo_metadata(
+            get_padded_M(M),
+            inter_dim,
+            dtype,
+            activation,
+            hidden_pad,
+            intermediate_pad,
+        )
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
     # Ensure block_size_M is int (metadata.block_m from CSV may be float)
@@ -1181,6 +1236,7 @@ def _fused_moe_impl(
             _metadata_config_file=_metadata_config_file,
             _stage1_extra_args=_stage1_extra_args,
             _stage2_extra_args=_stage2_extra_args,
+            _sbo_args=_sbo_args,
             output=output,
         )
         return _return_output(ret, output)
@@ -1618,6 +1674,7 @@ def _flydsl_stage2_wrapper(
     model_dim_pad: int = 0,
     expert_mask=None,
     topk_ids=None,
+    sbo_tile_state=None,
     **_kwargs,
 ):
     inter_dim_pad, model_dim_pad = _get_padding_for_flydsl(
@@ -1666,6 +1723,75 @@ def _flydsl_stage2_wrapper(
         xcd_swizzle=parsed.get("xcd_swizzle", 0),
         expert_mask=expert_mask,
         topk_ids=topk_ids,
+        sbo_tile_state=sbo_tile_state,
+    )
+
+
+def _get_mori_sbo_metadata(
+    token: int,
+    inter_dim: int,
+    dtype: torch.dtype,
+    activation: ActivationType,
+    hidden_pad: int,
+    intermediate_pad: int,
+) -> MOEMetadata:
+    """Select the strict atomic A8W4 kernel pair required by SBO v1."""
+    from aiter.ops.flydsl.moe_kernels import (
+        flydsl_kernel_name,
+        get_flydsl_kernel_params,
+        pick_flydsl_stage2_tile_k,
+    )
+
+    if token < 2048:
+        tile_m, stage1_suffix, stage2_suffix = 32, "_w2", "_bnt2"
+    elif token < 4096:
+        tile_m, stage1_suffix, stage2_suffix = 64, "_w3_bnt0", ""
+    else:
+        raise ValueError(f"MORI SBO v1 only supports decode M < 4096, got {token}")
+
+    out_type = "bf16" if dtype == dtypes.bf16 else "f16"
+    stage2_tile_k = pick_flydsl_stage2_tile_k(inter_dim)
+    base_stage1 = flydsl_kernel_name(
+        1, "fp8", "fp4", out_type, tile_m, 128, 256
+    )
+    base_stage2 = flydsl_kernel_name(
+        2, "fp8", "fp4", out_type, tile_m, 128, stage2_tile_k, "atomic"
+    )
+    stage1_name = f"{base_stage1}{stage1_suffix}_gui"
+    stage2_name = f"{base_stage2}{stage2_suffix}"
+    if get_flydsl_kernel_params(stage1_name) is None:
+        stage1_name = f"{base_stage1}_gui"
+    if get_flydsl_kernel_params(stage2_name) is None:
+        stage2_name = base_stage2
+    if (
+        get_flydsl_kernel_params(stage1_name) is None
+        or get_flydsl_kernel_params(stage2_name) is None
+    ):
+        raise ValueError(
+            "MORI SBO v1 atomic A8W4 kernels are unavailable: "
+            f"{stage1_name=}, {stage2_name=}"
+        )
+
+    enable_bias = _needs_swiglu_bias_support(dtype, QuantType.per_1x32)
+    return MOEMetadata(
+        functools.partial(
+            _flydsl_stage1_wrapper,
+            kernelName=stage1_name,
+            activation=activation,
+            inter_dim_pad=intermediate_pad,
+            model_dim_pad=hidden_pad,
+        ),
+        functools.partial(
+            _flydsl_stage2_wrapper,
+            kernelName=stage2_name,
+            inter_dim_pad=intermediate_pad,
+            model_dim_pad=hidden_pad,
+        ),
+        tile_m,
+        -1,
+        False,
+        has_bias=enable_bias,
+        stage2_has_bias=enable_bias,
     )
 
 
@@ -3178,6 +3304,7 @@ def fused_moe_2stages(
     _metadata_config_file: str | None = None,
     _stage1_extra_args: dict | None = None,
     _stage2_extra_args: dict | None = None,
+    _sbo_args: dict | None = None,
     output=None,
 ):
     quant_func = get_quant(quant_type)
@@ -3221,6 +3348,15 @@ def fused_moe_2stages(
     )
     if _metadata_transform is not None:
         metadata = _metadata_transform(metadata)
+    if _sbo_args is not None:
+        metadata = _get_mori_sbo_metadata(
+            get_padded_M(token_num),
+            inter_dim,
+            dtype,
+            activation,
+            hidden_pad,
+            intermediate_pad,
+        )
     if not metadata.prequant:
         a1 = hidden_states
         a1_scale = None
@@ -3351,6 +3487,79 @@ def fused_moe_2stages(
     need_bias_support = _needs_swiglu_bias_support(dtype, quant_type)
     stage1_func = getattr(metadata.stage1, "func", metadata.stage1)
     stage2_func = getattr(metadata.stage2, "func", metadata.stage2)
+    sbo_config = None
+    if _sbo_args is not None:
+        kernel_name = getattr(metadata.stage2, "keywords", {}).get("kernelName", "")
+        parsed = aiter.ops.flydsl.moe_kernels.get_flydsl_kernel_params(kernel_name)
+        expected = {
+            "tile_n": 128,
+            "tile_k": 256,
+            "a_dtype": "fp8",
+            "b_dtype": "fp4",
+            "mode": "atomic",
+        }
+        if (
+            stage2_func is not _flydsl_stage2_wrapper
+            or any(
+                parsed is None or parsed.get(key) != value
+                for key, value in expected.items()
+            )
+            or parsed.get("tile_m") not in (32, 64)
+        ):
+            raise ValueError(
+                "MORI SBO v1 requires FlyDSL A8W4 atomic stage2 "
+                f"tile_m in (32, 64) and {expected}, "
+                f"got kernel={kernel_name!r} params={parsed}"
+            )
+        if (model_dim, inter_dim, E, topk) != (7168, 3072, 48, 6):
+            raise ValueError(
+                "MORI SBO v1 requires DSV4 EP8 geometry "
+                f"(7168, 3072, 48, 6), got {(model_dim, inter_dim, E, topk)}"
+            )
+        route_tiles = _sbo_args["route_tiles"]
+        tile_state = _sbo_args["tile_state"]
+        start_event = _sbo_args["start_event"]
+        if (
+            route_tiles.ndim != 2
+            or route_tiles.shape[0] < token_num
+            or route_tiles.shape[1] != topk
+            or route_tiles.dtype != torch.int32
+            or not route_tiles.is_contiguous()
+            or route_tiles.device != device
+        ):
+            raise ValueError(
+                f"MORI SBO route_tiles must be int32 [capacity>={token_num}, {topk}], "
+                f"got {route_tiles.dtype} {tuple(route_tiles.shape)}"
+            )
+        route_tiles = route_tiles[:token_num]
+        sbo_tile_m = int(parsed["tile_m"])
+        # Sorting pads each expert independently, so producer tile IDs span
+        # the padded sorted buffer rather than the unpadded route count.
+        tile_capacity = (sorted_ids.numel() + sbo_tile_m - 1) // sbo_tile_m
+        if (
+            tile_state.dtype != torch.int32
+            or not tile_state.is_contiguous()
+            or tile_state.device != device
+            or tile_state.numel() < tile_capacity
+        ):
+            raise ValueError(
+                "MORI SBO tile_state must be contiguous int32 with at least "
+                f"{tile_capacity} elements"
+            )
+        expected_n_tiles = (
+            model_dim - hidden_pad + expected["tile_n"] - 1
+        ) // expected["tile_n"]
+        if int(_sbo_args["expected_n_tiles"]) != expected_n_tiles:
+            raise ValueError(
+                f"MORI SBO expected_n_tiles must be {expected_n_tiles}, "
+                f"got {_sbo_args['expected_n_tiles']}"
+            )
+        sbo_config = (
+            route_tiles,
+            tile_state,
+            start_event,
+            sbo_tile_m,
+        )
     if not metadata.run_1stage and need_bias_support:
         if metadata.has_bias:
             extra_stage1_args["bias1"] = _normalize_bias_for_kernel(bias1)
@@ -3516,6 +3725,26 @@ def fused_moe_2stages(
         a2 = a2.view(token_num, topk, inter_dim)
 
     stage2_sorted_weights = sorted_weights if not doweight_stage1 else None
+    if sbo_config is not None:
+        from aiter.ops.triton.moe.sbo import build_mori_sbo_route_tiles
+
+        (
+            route_tiles,
+            tile_state,
+            start_event,
+            sbo_tile_m,
+        ) = sbo_config
+        tile_state.zero_()
+        build_mori_sbo_route_tiles(
+            sorted_ids,
+            num_valid_ids,
+            route_tiles,
+            token_num=token_num,
+            topk=topk,
+            tile_m=sbo_tile_m,
+        )
+        start_event.record()
+        extra_stage2_args["sbo_tile_state"] = tile_state
     _stage2_call = functools.partial(
         metadata.stage2,
         a2,

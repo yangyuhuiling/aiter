@@ -50,6 +50,7 @@ from aiter.ops.flydsl.kernels import buffer_ops, vector
 from aiter.ops.flydsl.kernels.kernels_common import default_f8_type
 from aiter.ops.flydsl.moe_common import GateMode
 
+from . import communication_ops_utils as comm_ops
 from .layout_utils import crd2idx, idx2crd
 from .layout_utils import get as layout_get
 from .mfma_epilogues import c_shuffle_epilog, default_epilog
@@ -3421,6 +3422,7 @@ def compile_mixed_moe_gemm2_common(
     b_nt: int = 0,
     xcd_swizzle: int = 0,
     shared_expert_id: int | None = None,
+    enable_sbo: bool = False,
 ):
     """Compile stage2 kernel (moe_gemm2): A2 @ W2.T -> [tokens, model_dim], atomic-add."""
     heterogeneous_b = shared_expert_id is not None
@@ -3429,6 +3431,8 @@ def compile_mixed_moe_gemm2_common(
             "FHMoE stage2 requires shared_expert_id == experts - 1; "
             f"got {shared_expert_id=} and {experts=}"
         )
+    if enable_sbo and (heterogeneous_b or not accumulate):
+        raise ValueError("MORI SBO signaling requires non-heterogeneous atomic stage2")
     del b_nt
     _sort_block_m = tile_m if sort_block_m <= 0 else sort_block_m
     if const_expr(_sort_block_m != tile_m and _sort_block_m % tile_m != 0):
@@ -3601,15 +3605,16 @@ def compile_mixed_moe_gemm2_common(
     xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
     heterogeneous_tag = f"_shared_fp8_e{shared_expert_id}" if heterogeneous_b else ""
     serial_n_tag = "_serialn128" if serial_shared_n else ""
+    sbo_tag = "_mori_sbo_v1" if enable_sbo else "_sboarg_v1"
     if heterogeneous_b:
         variant_tags = (
             f"_vscale_fix3_fp4opt_v2{pm_tag}{sbm_tag}{wpe_tag}{async_tag}"
-            f"{cumul_tag}{acc_tag}{xcd_tag}{heterogeneous_tag}{serial_n_tag}"
+            f"{cumul_tag}{acc_tag}{xcd_tag}{heterogeneous_tag}{serial_n_tag}{sbo_tag}"
         )
     else:
         variant_tags = (
             f"_vscale_fix3_fp4opt_v1{pm_tag}{sbm_tag}{wpe_tag}{async_tag}"
-            f"{cumul_tag}{xcd_tag}{acc_tag}"
+            f"{cumul_tag}{xcd_tag}{acc_tag}{sbo_tag}"
         )
     module_name = (
         f"mfma_moe2_a{a_dtype}_w{b_dtype}_{out_s}_{epilog_tag}"
@@ -3644,6 +3649,7 @@ def compile_mixed_moe_gemm2_common(
             arg_sorted_weights: fx.Pointer,
             arg_num_valid_ids: fx.Pointer,
             arg_bias: fx.Pointer,
+            arg_sbo_tile_state: fx.Pointer,
             i32_tokens_in: fx.Int32,
             i32_n_in: fx.Int32,
             i32_k_in: fx.Int32,
@@ -3658,6 +3664,11 @@ def compile_mixed_moe_gemm2_common(
             f32 = T.f32
             i32 = T.i32
             i64 = T.i64
+            sbo_tile_state_base = (
+                fx.Int64(fx.ptrtoint(arg_sbo_tile_state))
+                if const_expr(enable_sbo)
+                else None
+            )
             vec4_f32 = T.vec(4, f32)
             vec16_elems = 16 if a_elem_bytes == 1 else 8
             vec8_elems = 8 if a_elem_bytes == 1 else 4
@@ -5368,6 +5379,21 @@ def compile_mixed_moe_gemm2_common(
                     precompute_row=precompute_row,
                     store_pair=store_pair,
                 )
+                if const_expr(enable_sbo):
+                    rocdl.s_waitcnt(0)
+                    gpu.barrier()
+                    tx_i32 = arith.index_cast(T.i32, tx)
+                    leader = arith.cmpi(
+                        CmpIPredicate.eq, tx_i32, arith.constant(0, type=T.i32)
+                    )
+                    leader_if = scf.IfOp(leader)
+                    with _if_then(leader_if):
+                        comm_ops.fence_agent_release()
+                        bx_i64 = fx.Int64(arith.index_cast(T.i64, bx))
+                        comm_ops.atomic_add_agent(
+                            sbo_tile_state_base + bx_i64 * fx.Int64(4),
+                            fx.Int32(1),
+                        )
                 rocdl.s_setprio(0)
 
             all_valid = arith.andi(blk_valid, arith.andi(exp_valid, tile_has_tokens))
@@ -5426,6 +5452,7 @@ def compile_mixed_moe_gemm2_common(
             arg_sorted_weights: fx.Pointer,
             arg_num_valid_ids: fx.Pointer,
             arg_bias: fx.Pointer,
+            arg_sbo_tile_state: fx.Pointer,
             i32_tokens_in: fx.Int32,
             i32_n_in: fx.Int32,
             i32_k_in: fx.Int32,
@@ -5444,6 +5471,7 @@ def compile_mixed_moe_gemm2_common(
                 arg_sorted_weights,
                 arg_num_valid_ids,
                 arg_bias,
+                arg_sbo_tile_state,
                 i32_tokens_in,
                 i32_n_in,
                 i32_k_in,
@@ -5464,6 +5492,7 @@ def compile_mixed_moe_gemm2_common(
             arg_sorted_weights: fx.Pointer,
             arg_num_valid_ids: fx.Pointer,
             arg_bias: fx.Pointer,
+            arg_sbo_tile_state: fx.Pointer,
             i32_tokens_in: fx.Int32,
             i32_n_in: fx.Int32,
             i32_k_in: fx.Int32,
@@ -5482,6 +5511,7 @@ def compile_mixed_moe_gemm2_common(
                 arg_sorted_weights,
                 arg_num_valid_ids,
                 arg_bias,
+                arg_sbo_tile_state,
                 i32_tokens_in,
                 i32_n_in,
                 i32_k_in,
@@ -5508,6 +5538,7 @@ def compile_mixed_moe_gemm2_common(
         waves_per_eu,
         use_async_copy,
         xcd_swizzle,
+        enable_sbo,
     )
     if heterogeneous_b:
         cache_tag += (shared_expert_id,)
@@ -5525,6 +5556,7 @@ def compile_mixed_moe_gemm2_common(
         arg_sorted_weights: fx.Pointer,
         arg_num_valid_ids: fx.Pointer,
         arg_bias: fx.Pointer,
+        arg_sbo_tile_state: fx.Pointer,
         i32_tokens_in: fx.Int32,
         i32_n_in: fx.Int32,
         i32_k_in: fx.Int32,
@@ -5567,6 +5599,7 @@ def compile_mixed_moe_gemm2_common(
                 arg_sorted_weights,
                 arg_num_valid_ids,
                 arg_bias,
+                arg_sbo_tile_state,
                 i32_tokens_in,
                 i32_n_in,
                 i32_k_in,
@@ -5584,6 +5617,7 @@ def compile_mixed_moe_gemm2_common(
                 arg_sorted_weights,
                 arg_num_valid_ids,
                 arg_bias,
+                arg_sbo_tile_state,
                 i32_tokens_in,
                 i32_n_in,
                 i32_k_in,
@@ -5616,6 +5650,7 @@ def compile_mixed_moe_gemm2_common(
             arg_sorted_weights: fx.Pointer,
             arg_num_valid_ids: fx.Pointer,
             arg_bias: fx.Pointer,
+            arg_sbo_tile_state: fx.Pointer,
             i32_tokens_in: fx.Int32,
             i32_n_in: fx.Int32,
             i32_k_in: fx.Int32,
@@ -5635,6 +5670,7 @@ def compile_mixed_moe_gemm2_common(
                 arg_sorted_weights,
                 arg_num_valid_ids,
                 arg_bias,
+                arg_sbo_tile_state,
                 i32_tokens_in,
                 i32_n_in,
                 i32_k_in,
@@ -5656,6 +5692,7 @@ def compile_mixed_moe_gemm2_common(
             arg_sorted_weights: fx.Pointer,
             arg_num_valid_ids: fx.Pointer,
             arg_bias: fx.Pointer,
+            arg_sbo_tile_state: fx.Pointer,
             i32_tokens_in: fx.Int32,
             i32_n_in: fx.Int32,
             i32_k_in: fx.Int32,
@@ -5675,6 +5712,7 @@ def compile_mixed_moe_gemm2_common(
                 arg_sorted_weights,
                 arg_num_valid_ids,
                 arg_bias,
+                arg_sbo_tile_state,
                 i32_tokens_in,
                 i32_n_in,
                 i32_k_in,
